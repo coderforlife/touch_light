@@ -2,10 +2,14 @@
  * Project: touch_light
  * Description: A touch light that syncs with other touch lights. Adapted from
  *              http://www.instructables.com/id/Networked-RGB-Wi-Fi-Decorative-Touch-Lights/
- * Author: Patrick Blesi
+ * Original Author: Patrick Blesi
  * Date: 2017-12-09
  *
+ * Modifications By: Jeff Bush (coderforlife)
+ * Date: 2018-12-21
  */
+ 
+// TODO: replace the constant broadcasting to a request-based event
 
 #include "neopixel.h"
 #include "application.h"
@@ -19,23 +23,39 @@
 
 String touchEventName = "touch_event";
 
-#define NUM_PARTICLES 4 // number of touch lights in your group
-// Number each Filimin starting at 1.
+// Number each starting at 1
 String particleId[] = {
   "",                         // 0
-  "330022001547353236343033", // pblesi
-  "2d0047001247353236343033", // carol
-  "2a0026000b47353235303037", // cindy
-  "2e003e001947353236343033"  // tammy
+  "400028000c47343438323536", // pennsylvania-glo-worm
+  "3f0039001051363036373538", // douglas-fir-glo-worm
 };
 
 int particleColors[] = {
-  0,   // Green
-  90,  // Magenta
-  170, // Blue
-  79,  // Orange
-  131  // Purple
+  0,
+  85,  // Green
+  6,  // Orange
 };
+
+int forbiddenColors[][3] = {
+  {-1,-1,-1},
+  {6,-1,-1},
+  {85,118,170},
+};
+
+int colorCycle[] = {
+      0, // red
+      6, // orange
+     15, // yellow
+     85, // green
+    118, // cyan
+    170, // blue
+    185, // purple
+    215, // pink
+    245, // magenta
+};
+
+
+#define ARRAY_SIZE(a) sizeof(a)/sizeof(a[0])
 
 // TWEAKABLE VALUES FOR CAP SENSING. THE BELOW VALUES WORK WELL AS A STARTING PLACE:
 // BASELINE_VARIANCE: The higher the number the less the baseline is affected by
@@ -50,26 +70,23 @@ int particleColors[] = {
 // but large values cause some latency.(was 32)
 #define SAMPLE_SIZE 512
 #define SAMPLES_BETWEEN_PIXEL_UPDATES 32
-#define LOOPS_TO_FINAL_COLOR 150
-
-const int minMaxColorDiffs[2][2] = {
-  {5,20},   // min/Max if color change last color change from same touch light
-  {50,128}  // min/Max if color change last color change from different touch light
-};
+#define LOOPS_TO_FINAL_COLOR 250
 
 // END VALUE, TIME
 // 160 is approximately 1 second
-const long envelopes[6][2] = {
-  {0, 0},      // NOT USED
-  {255, 30},   // ATTACK
-  {200, 240},  // DECAY
-  {200, 1000}, // SUSTAIN
-  {150, 60},   // RELEASE1
-  {0, 1000000} // RELEASE2 (65535 is about 6'45")
+const long envelopes[8][2] = {
+  {0, 0},       // NOT USED
+  {255, 30},    // ATTACK   ~200 ms
+  {205, 240},   // DECAY    ~1.5 sec
+  {205, 1000},  // SUSTAIN  ~6.25 sec
+  {155, 60},    // RELEASE1 ~400 ms to go from ~80% brightness to ~60% brightness
+  {40, 300000}, // RELEASE2 ~30 min to go from ~60% brightness to ~15% brightness
+  {10, 300000}, // RELEASE3 ~30 min to go from ~15% brightness to ~4% brightness
+  {10, 0},      // HOLD     will be held at ~4% brightness forever
 };
 
-#define PERIODIC_UPDATE_TIME 5 // seconds
-#define COLOR_CHANGE_WINDOW 10 // seconds
+#define PERIODIC_UPDATE_TIME 30 // seconds
+#define COLOR_CHANGE_WINDOW  15 // seconds
 
 // CONFIGURATION SETTINGS END
 
@@ -79,7 +96,9 @@ const long envelopes[6][2] = {
 #define SUSTAIN 3
 #define RELEASE1 4
 #define RELEASE2 5
-#define OFF 6
+#define RELEASE3 6
+#define HOLD 7
+#define OFF 8
 
 #define LOCAL_CHANGE 0
 #define REMOTE_CHANGE 1
@@ -109,7 +128,7 @@ int rPin = D3;
 unsigned char myId = 0;
 
 int currentEvent = tEVENT_NONE;
-int eventTime = Time.now();
+int eventTime = 0;
 int eventTimePrecision = random(INT_MAX);
 
 int initColor = 0;
@@ -165,7 +184,7 @@ void setup()
   pinMode(sPin, OUTPUT);
   attachInterrupt(rPin, touchSense, RISING);
 
-  myId = getMyId(particleId, NUM_PARTICLES);
+  myId = getMyId(particleId, ARRAY_SIZE(particleId));
 
   flashWhite(&strip);
 
@@ -256,19 +275,17 @@ void traverseColorWheel(Adafruit_NeoPixel* strip) {
       strip->setPixelColor(j, color);
       strip->show();
     }
-    delay(1);
   }
 }
 
 void fade(Adafruit_NeoPixel* strip) {
   int numPixels = strip->numPixels();
-  for (int j = 255; j >= 0; j--) {
+  for (int j = 255; j >= 0; j-=2) {
     uint32_t color = wheelColor(255, j);
     for (byte k = 0; k < numPixels; k++) {
       strip->setPixelColor(k, color);
       strip->show();
     }
-    delay(1);
   }
 }
 
@@ -416,8 +433,8 @@ void handleTouchEvent(const char *event, const char *data) {
     Particle.publish("touch_response", response, 61, PRIVATE);
   }
 
-  if (deviceId == myId) return;
-  if (serverEventTime < eventTime) return;
+  if (deviceId == myId) { return; }
+  if (serverEventTime < eventTime) { return; }
   // Race condition brought colors out of sync
   if (
     serverEventTime == eventTime &&
@@ -429,7 +446,7 @@ void handleTouchEvent(const char *event, const char *data) {
     changeState(ATTACK, REMOTE_CHANGE);
     return;
   }
-  if (serverEventTime == eventTime && serverEventTimePrecision <= eventTimePrecision) return;
+  if (serverEventTime == eventTime && serverEventTimePrecision <= eventTimePrecision) { return; }
 
   // Valid remote update
   setEvent(serverEvent, serverEventTime, serverEventTimePrecision);
@@ -457,21 +474,28 @@ void setColor(int color, unsigned char prevState, unsigned char deviceId) {
   }
 }
 
+int find(int x, int arr[], int n) {
+    for (int i = 0; i < n; i++) {
+        if (arr[i] == x) { return i; }
+    }
+    return -1;
+}
+
 int generateColor(int currentFinalColor, unsigned char prevState, int lastColorChangeDeviceId) {
-  int color = 0;
-  int now = Time.now();
+  int color, now = Time.now();
   Serial.println("generating color...");
   if (prevState == OFF || lastLocalColorChangeTime < now - COLOR_CHANGE_WINDOW) {
     color = particleColors[myId];
   } else {
-    bool foreignId = (lastColorChangeDeviceId != myId);
-    int minChange = minMaxColorDiffs[foreignId][0];
-    int maxChange = minMaxColorDiffs[foreignId][1];
-    int direction = random(2) * 2 - 1;
-    int magnitude = random(minChange, maxChange + 1);
-    color = currentFinalColor + direction * magnitude;
-    color = (color + 256) % 256;
-    // color = 119; // FORCE A COLOR
+    int n = ARRAY_SIZE(colorCycle), nf = ARRAY_SIZE(forbiddenColors[myId]);
+    int c = find(currentFinalColor, colorCycle, n);
+    if (c == -1) { c = random(n); } // not found, pick a random one
+    c = (c + 1) % n; // advance to the next color
+    color = colorCycle[c];
+    while (find(color, forbiddenColors[myId], nf) != -1) {
+        c = (c + 1) % n; // advance to the next color
+        color = colorCycle[c];
+    }
   }
   lastLocalColorChangeTime = now;
   if (D_SERIAL) { Serial.print("final color: "); Serial.println(finalColor); }
@@ -525,8 +549,18 @@ void updateState() {
       break;
     case RELEASE2:
       if (loopCount >= envelopes[RELEASE2][TIME]) {
-        changeState(OFF, LOCAL_CHANGE);
+        changeState(RELEASE3, LOCAL_CHANGE);
       }
+      break;
+    case RELEASE3:
+      if (loopCount >= envelopes[RELEASE3][TIME]) {
+        changeState(HOLD, LOCAL_CHANGE);
+      }
+      break;
+    case HOLD:
+      /*if (loopCount >= envelopes[HOLD][TIME]) {
+        changeState(OFF, LOCAL_CHANGE);
+      }*/
       break;
   }
 
@@ -543,6 +577,7 @@ void updateState() {
 
 int getCurrentBrightness(unsigned char state, int initBrightness, int loopCount) {
   if (state == OFF) return 0;
+  if (envelopes[state][TIME] == 0) return envelopes[state][END_VALUE];
   int brightnessDistance = envelopes[state][END_VALUE] - initBrightness;
   int brightnessDistanceXElapsedTime = brightnessDistance * loopCount / envelopes[state][TIME];
   return min(255, max(0, initBrightness + brightnessDistanceXElapsedTime));
@@ -556,14 +591,13 @@ int getCurrentColor(int finalColor, int initColor, int colorLoopCount) {
 }
 
 int calcColorChange(int currentColor, int finalColor) {
-  int colorChange = finalColor - currentColor;
-  int direction = (colorChange < 0) * 2 - 1;
-  colorChange += direction * (abs(colorChange) > 127) * 256;
-  return colorChange;
+  int d = currentColor - finalColor;
+  return abs(d) > 127 ? d : -d;
 }
 
 void updateNeoPixels(uint32_t color) {
-  for(char i = 0; i < strip.numPixels(); i++) {
+  uint16_t n = strip.numPixels();
+  for (char i = 0; i < n; i++) {
     strip.setPixelColor(i, color);
   }
   strip.show();
@@ -576,27 +610,26 @@ void updateNeoPixels(uint32_t color) {
 // Wheel
 //------------------------------------------------------------
 
-uint32_t wheelColor(byte WheelPos, byte iBrightness) {
-  float R, G, B;
-  float brightness = iBrightness / 255.0;
+byte scale(byte x, float scale) {
+    return (byte)(x * scale + .5);
+}
 
-  if (WheelPos < 85) {
-    R = WheelPos * 3;
-    G = 255 - WheelPos * 3;
-    B = 0;
-  } else if (WheelPos < 170) {
-    WheelPos -= 85;
-    R = 255 - WheelPos * 3;
-    G = 0;
-    B = WheelPos * 3;
-  } else {
-    WheelPos -= 170;
-    R = 0;
-    G = WheelPos * 3;
-    B = 255 - WheelPos * 3;
-  }
-  R = R * brightness + .5;
-  G = G * brightness + .5;
-  B = B * brightness + .5;
-  return strip.Color((byte) R,(byte) G,(byte) B);
+// Converts HSV color to RGB color
+// hue is from 0 to 255 around the circle
+// saturation is fixed to max
+// value (brightness) is from 0 to 255
+uint32_t wheelColor(byte hue, byte value) {
+    //hue %= 256;
+    //if (hue < 0) { hue += 256; }
+    int H6 = 6*(int)hue;
+    byte R = 0, G = 0, B = 0;
+    // each 1/6 of a circle (42.5 is 1/6 of 255)
+    if (hue < 43) { R = 255; G = H6; }
+    else if (hue < 86) { R = 510-H6; G = 255; }
+    else if (hue < 128) { G = 255; B = H6-510; }
+    else if (hue < 171) { G = 1020-H6; B = 255; }
+    else if (hue < 213) { R = H6-1020; B = 255; }
+    else { R = 255; B = 1530-H6; }
+    float brightness = value / 255.0;
+    return strip.Color(scale(R, brightness), scale(G, brightness), scale(B, brightness));
 }
